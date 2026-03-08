@@ -4,6 +4,7 @@ import network
 import ujson
 import ubinascii
 import urequests
+from machine import Pin
 
 try:
     import camera
@@ -14,6 +15,9 @@ from config import WIFI_SSID, WIFI_PASSWORD, OPENAI_API_KEY, MODEL
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 MAX_TOKENS = 250
+MIN_SECONDS_BETWEEN_REQUESTS = 10
+BUTTON_PINS = (1, 2)
+last_request_ts = None
 
 
 def connect_wifi(timeout_s=20):
@@ -80,7 +84,12 @@ def ask_openai(prompt, image_b64):
     try:
         resp = urequests.post(OPENAI_URL, headers=headers, data=ujson.dumps(payload))
         if resp.status_code != 200:
-            raise RuntimeError("OpenAI {}: {}".format(resp.status_code, resp.text))
+            body = resp.text
+            if resp.status_code == 429 and "insufficient_quota" in body:
+                raise RuntimeError(
+                    "OpenAI quota exceeded (insufficient_quota). Add billing/credits, then retry."
+                )
+            raise RuntimeError("OpenAI {}: {}".format(resp.status_code, body))
         data = resp.json()
         return data["choices"][0]["message"]["content"]
     finally:
@@ -88,9 +97,39 @@ def ask_openai(prompt, image_b64):
             resp.close()
 
 
-def loop():
-    print("Enter prompt. Type exit to stop.")
+def init_buttons():
+    buttons = []
+    for pin_num in BUTTON_PINS:
+        try:
+            buttons.append((pin_num, Pin(pin_num, Pin.IN, Pin.PULL_UP)))
+        except Exception as exc:
+            print("Warning: GPIO{} unavailable: {}".format(pin_num, exc))
+    if not buttons:
+        raise RuntimeError("No valid button pins. Check BUTTON_PINS.")
+    return buttons
+
+
+def wait_for_button_press(buttons):
+    print("Press button on GPIO1 or GPIO2 to start...")
     while True:
+        for pin_num, btn in buttons:
+            if btn.value() == 0:
+                time.sleep_ms(30)
+                if btn.value() == 0:
+                    while btn.value() == 0:
+                        time.sleep_ms(10)
+                    print("Button trigger: GPIO{}".format(pin_num))
+                    return pin_num
+        time.sleep_ms(20)
+
+
+def loop():
+    global last_request_ts
+    buttons = init_buttons()
+    print("Button trigger enabled on GPIO1/GPIO2 (active-low, pull-up).")
+    print("Min seconds between API calls:", MIN_SECONDS_BETWEEN_REQUESTS)
+    while True:
+        wait_for_button_press(buttons)
         prompt = input("Prompt> ").strip()
         if not prompt:
             continue
@@ -100,7 +139,14 @@ def loop():
             gc.collect()
             image_b64, size = capture_base64_jpeg()
             print("Captured:", size, "bytes")
+            if last_request_ts is not None:
+                elapsed = time.time() - last_request_ts
+                if elapsed < MIN_SECONDS_BETWEEN_REQUESTS:
+                    wait_s = MIN_SECONDS_BETWEEN_REQUESTS - elapsed
+                    print("Rate limit wait:", wait_s, "s")
+                    time.sleep(wait_s)
             reply = ask_openai(prompt, image_b64)
+            last_request_ts = time.time()
             print("\nAssistant:\n{}\n".format(reply))
         except Exception as e:
             print("Error:", e)
